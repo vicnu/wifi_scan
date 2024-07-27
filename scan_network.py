@@ -1,96 +1,110 @@
-from scapy.all import ARP, Ether, srp
-import socket
+import argparse
+import subprocess
 import netifaces
 import sys
-import time
+import os
 import requests
+import json
+import time
 
-# Function to lookup MAC address manufacturer
-def lookup_mac_address(mac):
-    try:
-        response = requests.get(f'https://api.macvendors.com/{mac}')
-        if response.status_code == 200:
-            return response.text
-        elif response.status_code == 429:  # Too Many Requests
-            return "Rate Limited"
-        else:
-            return "Unknown Device"
-    except requests.RequestException:
-        return "Unknown Device"
+from scapy.all import ARP, Ether, srp
 
-def get_device_name(ip):
-    try:
-        return socket.gethostbyaddr(ip)[0]
-    except socket.herror:
-        return "Unknown"
+CACHE_FILE = "mac_cache.json"
 
-def get_network_range(interface='en0'):
+def activate_virtualenv():
+    # Activate the virtual environment if not already activated
+    activate_script = os.path.join(os.getcwd(), 'myenv/bin/activate')
+    command = f". {activate_script} && exec python3 {' '.join(sys.argv)}"
+    subprocess.run(command, shell=True, check=True)
+    sys.exit(0)
+
+def get_network_range(interface):
+    # Get the network range for the specified interface
     addresses = netifaces.ifaddresses(interface)
-    if netifaces.AF_INET in addresses:
-        link = addresses[netifaces.AF_INET][0]
-        ip = link.get('addr')
-        netmask = link.get('netmask')
-        if ip and netmask:
-            cidr = netmask_to_cidr(netmask)
-            if cidr is not None:
-                print(f"Using interface: {interface} with IP {ip}/{cidr}")
-                return f"{ip}/{cidr}"
-    print(f"No valid IPv4 address found on {interface}.")
-    return None
+    ip_info = addresses[netifaces.AF_INET][0]
+    ip = ip_info['addr']
+    netmask = ip_info['netmask']
+    cidr = sum(bin(int(x)).count('1') for x in netmask.split('.'))
+    return f"{ip}/{cidr}"
 
-def netmask_to_cidr(netmask):
+def load_cache():
+    if os.path.exists(CACHE_FILE):
+        with open(CACHE_FILE, 'r') as file:
+            return json.load(file)
+    return {}
+
+def save_cache(cache):
+    with open(CACHE_FILE, 'w') as file:
+        json.dump(cache, file)
+
+def get_device_type(mac_address, cache):
+    if mac_address in cache:
+        return cache[mac_address]
+
+    url = f"https://api.macvendors.com/{mac_address}"
     try:
-        return sum([bin(int(x)).count('1') for x in netmask.split('.')])
-    except ValueError:
-        return None
+        response = requests.get(url)
+        if response.status_code == 200:
+            device_type = response.text
+        elif response.status_code == 429:
+            return "Rate limit exceeded. Try again later."
+        else:
+            device_type = "Unknown device"
+    except Exception as e:
+        device_type = f"Error: {str(e)}"
+    
+    cache[mac_address] = device_type
+    save_cache(cache)
+    time.sleep(1)  # Delay to avoid hitting the rate limit
+    return device_type
 
-def scan_network(target_ip):
-    print(f"Scanning network range: {target_ip}")
-
-    arp = ARP(pdst=target_ip)
-    ether = Ether(dst="ff:ff:ff:ff:ff:ff")
-    packet = ether/arp
-
+def scan_network(network_range, cache):
+    packet = Ether(dst="ff:ff:ff:ff:ff:ff") / ARP(pdst=network_range)
+    result = srp(packet, timeout=10, verbose=1)[0]
     devices = []
-    # Perform scan and retry up to 3 times with a longer timeout
-    for attempt in range(3):
-        print(f"Attempt {attempt + 1}")
-        result = srp(packet, timeout=10, verbose=1)[0]  # Increased timeout and verbosity
-        
-        for sent, received in result:
-            if received.psrc not in [d['IP'] for d in devices]:
-                print(f"Received response from {received.psrc} ({received.hwsrc})")
-                device_info = {
-                    "IP": received.psrc,
-                    "MAC": received.hwsrc,
-                    "Name": get_device_name(received.psrc),
-                    "Type": lookup_mac_address(received.hwsrc)  # Added manufacturer lookup
-                }
-                devices.append(device_info)
-        
-        time.sleep(5)  # Wait before the next attempt
-
+    for sent, received in result:
+        device_type = get_device_type(received.hwsrc, cache)
+        devices.append({
+            "ip": received.psrc,
+            "mac": received.hwsrc,
+            "device_type": device_type
+        })
     return devices
 
-def save_to_file(devices, filename):
+def save_results(devices, filename):
     with open(filename, 'w') as file:
-        file.write("IP Address\tMAC Address\t\tDevice Name\t\tDevice Type\n")
-        file.write("=" * 80 + "\n")
+        file.write("IP\t\tDevice\t\tMAC Address\t\n")
+        file.write("-" * 70 + "\n")
         for device in devices:
-            # Handling "Rate Limited" and "Unknown Device"
-            device_type = device['Type']
-            if "Rate Limited" in device_type:
-                device_type = "Unknown Device (Rate Limited)"
-            elif "Unknown Device" in device_type:
-                device_type = "Unknown Device"
-            file.write(f"{device['IP']}\t{device['MAC']}\t{device['Name']}\t{device_type}\n")
+            file.write(f"{device['ip']}\t{device['device_type']}\t{device['mac']}\n")
+
+def main(interface):
+    print("Available interfaces:", netifaces.interfaces())
+    if not interface:
+        print("No interface specified, using default interface.")
+        interface = "wlo1"
+    
+    try:
+        target_ip = get_network_range(interface)
+    except (ValueError, KeyError):
+        print("Error: You must specify a valid interface name.")
+        sys.exit(1)
+
+    print("Scanning network range:", target_ip)
+    cache = load_cache()
+    devices = scan_network(target_ip, cache)
+    for device in devices:
+        print(f"IP: {device['ip']}, MAC: {device['mac']}, Device: {device['device_type']}")
+    
+    save_results(devices, "network_devices.txt")
+    print("Results saved to network_devices.txt")
 
 if __name__ == "__main__":
-    target_ip = get_network_range()
-    if target_ip:
-        devices = scan_network(target_ip)
-        save_to_file(devices, "network_devices.txt")
-        print(f"Found {len(devices)} devices. Results saved to network_devices.txt")
-    else:
-        print("Could not determine the network range.")
-        sys.exit(1)
+    if not os.getenv('VIRTUAL_ENV'):
+        activate_virtualenv()
+
+    parser = argparse.ArgumentParser(description="Scan the local network for devices.")
+    parser.add_argument("-i", "--interface", help="Specify the network interface to scan", default="wlo1")
+    args = parser.parse_args()
+
+    main(args.interface)
